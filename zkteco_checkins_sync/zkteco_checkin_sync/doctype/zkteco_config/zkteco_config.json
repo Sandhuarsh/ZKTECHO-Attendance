@@ -1,0 +1,181 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-08-15 11:00:30.786370",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "enable_sync",
+  "section_break_dakd",
+  "username",
+  "password",
+  "zkteco_api_credentials_section",
+  "server_ip",
+  "server_port",
+  "column_break_whif",
+  "register_api_token",
+  "token",
+  "zkteco_sync_setup_section",
+  "seconds",
+  "column_break_erpv",
+  "test_connection",
+  "sync_status_section",
+  "last_sync",
+  "column_break_sync",
+  "total_synced_records"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "fieldname": "enable_sync",
+   "fieldtype": "Check",
+   "label": "Enable Sync"
+  },
+  {
+   "depends_on": "eval: doc.enable_sync === 1;",
+   "fieldname": "section_break_dakd",
+   "fieldtype": "Section Break",
+   "label": "ZKTeco Superuser Credentials"
+  },
+  {
+   "fieldname": "username",
+   "fieldtype": "Data",
+   "label": "Username",
+   "mandatory_depends_on": "eval: doc.enable_sync === 1;"
+  },
+  {
+   "fieldname": "password",
+   "fieldtype": "Password",
+   "label": "Password",
+   "mandatory_depends_on": "eval: doc.enable_sync === 1;"
+  },
+  {
+   "depends_on": "eval: doc.enable_sync === 1;",
+   "fieldname": "zkteco_api_credentials_section",
+   "fieldtype": "Section Break",
+   "label": "ZKTeco API Credentials"
+  },
+  {
+   "fieldname": "token",
+   "fieldtype": "Data",
+   "label": "Token",
+   "read_only": 1
+  },
+  {
+   "description": "IP address of the ZKBio Time server ipv4",
+   "fieldname": "server_ip",
+   "fieldtype": "Data",
+   "label": "Server IP",
+   "mandatory_depends_on": "eval: doc.enable_sync === 1;"
+  },
+  {
+   "default": "80",
+   "description": "Can be found while installing the ZKBio Time",
+   "fieldname": "server_port",
+   "fieldtype": "Data",
+   "label": "Server Port",
+   "mandatory_depends_on": "eval: doc.enable_sync === 1;"
+  },
+  {
+   "depends_on": "eval: doc.enable_sync === 1;",
+   "fieldname": "zkteco_sync_setup_section",
+   "fieldtype": "Section Break",
+   "label": "ZKTeco Sync Setup"
+  },
+  {
+   "default": "300",
+   "description": "(Sync after every X seconds)",
+   "fieldname": "seconds",
+   "fieldtype": "Select",
+   "label": "Sync Frequency",
+   "options": "10\n30\n60\n120\n300\n600\n900\n1800\n3600",
+   "mandatory_depends_on": "eval: doc.enable_sync === 1;"
+  },
+  {
+   "depends_on": "eval:doc.server_ip && doc.server_port",
+   "fieldname": "register_api_token",
+   "fieldtype": "Button",
+   "label": "Register API token"
+  },
+  {
+   "fieldname": "column_break_whif",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "column_break_erpv",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "eval:doc.server_ip && doc.server_port && doc.token",
+   "fieldname": "test_connection",
+   "fieldtype": "Button",
+   "label": "Test Connection"
+  },
+  {
+   "collapsible": 1,
+   "depends_on": "eval: doc.enable_sync === 1;",
+   "fieldname": "sync_status_section",
+   "fieldtype": "Section Break",
+   "label": "Sync Status & Statistics"
+  },
+  {
+   "fieldname": "last_sync",
+   "fieldtype": "Datetime",
+   "label": "Last Sync Time",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_sync",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "total_synced_records",
+   "fieldtype": "Int",
+   "label": "Total Synced Records",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-08-15 11:55:49.086988",
+ "modified_by": "Administrator",
+ "module": "ZKTeco Checkin Sync",
+ "name": "ZKTeco Config",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "HR Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "HR User",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
