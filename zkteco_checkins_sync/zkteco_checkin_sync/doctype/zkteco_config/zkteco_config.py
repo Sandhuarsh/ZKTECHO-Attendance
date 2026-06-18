@@ -862,24 +862,47 @@ def create_employee_checkin(transaction):
 
 def find_employee_by_code(emp_code):
     """
-    Find employee by various ID fields
+    Find Employee using ZKTeco/EasyTime employee code.
+    Priority:
+    1. attendance_device_id
+    2. employee
+    3. user_id
     """
-    # Try employee field first
-    employee = frappe.db.get_value("Employee", {"employee": emp_code}, "name")
-    if employee:
-        return employee
-    
-    # Try user_id field
-    employee = frappe.db.get_value("Employee", {"user_id": emp_code}, "name")
-    if employee:
-        return employee
-    
-    # Try attendance_device_id if it exists
+
+    emp_code = str(emp_code).strip()
+
+    # Attendance Device ID (Biometric/RF tag ID)
     if frappe.db.has_column("Employee", "attendance_device_id"):
-        employee = frappe.db.get_value("Employee", {"attendance_device_id": emp_code}, "name")
+        employee = frappe.db.get_value(
+            "Employee",
+            {"attendance_device_id": emp_code},
+            "name"
+        )
         if employee:
             return employee
-    
+
+    # Employee ID
+    employee = frappe.db.get_value(
+        "Employee",
+        {"employee": emp_code},
+        "name"
+    )
+    if employee:
+        return employee
+
+    # User ID
+    employee = frappe.db.get_value(
+        "Employee",
+        {"user_id": emp_code},
+        "name"
+    )
+    if employee:
+        return employee
+
+    frappe.logger().info(
+        f"Employee mapping not found for emp_code: {emp_code}"
+    )
+
     return None
 
 
