@@ -339,17 +339,13 @@ def create_employee_checkin(transaction):
         log_type = "IN"
         punch_display_lower = str(punch_state_display).strip().lower() if punch_state_display else ""
         
-        # 2. Check for explicit OUT states (like your manual logs)
-        if str(punch_state) == "1" or punch_display_lower in ["check out", "out", "checkout"]:
+        # If punch_state is 255, we should ignore display and use fallback alternating logic
+        if str(punch_state) != "255" and (str(punch_state) == "1" or punch_display_lower in ["check out", "out", "checkout"]):
             log_type = "OUT"
-
-        # 3. Check for explicit IN states
-        elif str(punch_state) == "0" or punch_display_lower in ["check in", "in", "checkin"]:
+        elif str(punch_state) != "255" and (str(punch_state) == "0" or punch_display_lower in ["check in", "in", "checkin"]):
             log_type = "IN"
-
-        # 4. THE MAGIC HAPPENS HERE: Fallback for State 255 (Unknown)
         else:
-            # Query the database to find the last punch this employee made BEFORE the current punch time
+            # Fallback for state 255 or unknown: alternate based on previous checkin today
             last_log = frappe.db.get_all(
                 "Employee Checkin", 
                 filters={"employee": employee, "time": ["<", punch_datetime]}, 
@@ -360,14 +356,16 @@ def create_employee_checkin(transaction):
             
             if last_log:
                 last_log_type = last_log[0].get("log_type")
-                last_log_time = last_log[0].get("time")
+                # Safely convert to datetime to avoid string attribute errors
+                from frappe.utils import get_datetime
+                last_log_time = get_datetime(last_log[0].get("time"))
                 
-                # If their last punch was on the SAME DAY, we do the opposite of what it was
+                # If last log was on the same day, alternate the state
                 if last_log_time.date() == punch_datetime.date():
                     if last_log_type == "IN":
-                        log_type = "OUT"   # Since last punch was IN, this must be OUT
+                        log_type = "OUT"
                     else:
-                        log_type = "IN"    # Since last punch was OUT, this must be IN
+                        log_type = "IN"
 
         
         # Check if checkin already exists (use transaction ID for uniqueness)
@@ -398,6 +396,15 @@ def create_employee_checkin(transaction):
             "device_id": f"{device_id} (ZKTeco-{transaction_id})" if transaction_id else device_id or "ZKTeco Device",
             "skip_auto_attendance": 0
         })
+        # --- DEBUG LOGGING ---
+        try:
+            debug_msg = f"Emp: {employee}, Time: {punch_datetime}, State: {punch_state}, Disp: {punch_state_display}, LogType: {log_type}"
+            if 'last_log' in locals() and last_log:
+                debug_msg += f"\n  -> Last Log: {last_log[0].get('time')} - {last_log[0].get('log_type')}"
+            frappe.log_error(message=debug_msg, title="ZKTeco Checkin Debug")
+        except Exception:
+            pass
+        # ---------------------
         
         checkin.insert(ignore_permissions=True)
         frappe.db.commit()
