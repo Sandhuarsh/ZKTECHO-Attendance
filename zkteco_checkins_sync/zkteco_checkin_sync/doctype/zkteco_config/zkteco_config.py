@@ -314,6 +314,7 @@ def create_employee_checkin(transaction):
         emp_code = transaction.get('emp_code')
         punch_time = transaction.get('punch_time')
         punch_state = transaction.get('punch_state')
+        punch_state_display = transaction.get('punch_state_display')
         device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
         transaction_id = transaction.get('id')
         
@@ -335,7 +336,7 @@ def create_employee_checkin(transaction):
         
         # Determine log type based on punch_state
         log_type = "IN"
-        if punch_state == "1":  # Based on API response: "1" = Check Out
+        if str(punch_state) == "1" or punch_state_display == "Check Out":
             log_type = "OUT"
         
         # Check if checkin already exists (use transaction ID for uniqueness)
