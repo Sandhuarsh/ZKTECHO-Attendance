@@ -317,6 +317,8 @@ def create_employee_checkin(transaction):
         punch_state_display = transaction.get('punch_state_display')
         device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
         transaction_id = transaction.get('id')
+
+        
         
         if not emp_code or not punch_time:
             frappe.log_error(f"Missing required fields in transaction: {transaction}", "ZKTeco Transaction Error")
@@ -366,6 +368,49 @@ def create_employee_checkin(transaction):
                         log_type = "OUT"
                     else:
                         log_type = "IN"
+        try:
+            debug_message = f"""
+================== ZKTeco Debug ==================
+
+RAW TRANSACTION
+---------------
+{frappe.as_json(transaction)}
+
+PARSED VALUES
+-------------
+Employee Code       : {emp_code}
+Employee            : {employee}
+Punch Time          : {punch_time}
+Punch Datetime      : {punch_datetime}
+Punch State         : {punch_state}
+Punch State Display : {punch_state_display}
+Device ID           : {device_id}
+Transaction ID      : {transaction_id}
+
+LOGIC RESULT
+------------
+Punch Display Lower : {punch_display_lower}
+Selected Log Type   : {log_type}
+
+LAST CHECKIN
+------------
+"""
+
+            if 'last_log' in locals() and last_log:
+                debug_message += f"""
+Previous Time       : {last_log[0].get("time")}
+Previous Log Type   : {last_log[0].get("log_type")}
+"""
+            else:
+                debug_message += "No previous checkin found.\n"
+
+            debug_message += "\n=================================================="
+
+            # Using positional arguments for cross-version compatibility
+            frappe.log_error(debug_message, "ZKTeco Complete Debug")
+
+        except Exception as debug_error:
+            frappe.log_error(str(debug_error), "ZKTeco Debug Error")             
 
         
         # Check if checkin already exists (use transaction ID for uniqueness)
