@@ -308,16 +308,16 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
 def create_debug_log(message):
     """Create Integration Log entry for debugging"""
     try:
-        frappe.get_doc({
+        doc = frappe.get_doc({
             "doctype": "Integration Log",
             "response": message
-        }).insert(ignore_permissions=True)
-
+        })
+        doc.insert(ignore_permissions=True)
         frappe.db.commit()
 
-    except Exception:
-        frappe.log_error(str(e), "Integration Log Debug Error")
-
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "Integration Log Debug Error")
+        raise
 
 
 def create_employee_checkin(transaction):
