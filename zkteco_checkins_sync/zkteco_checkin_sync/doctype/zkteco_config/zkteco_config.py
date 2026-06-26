@@ -374,7 +374,6 @@ def create_employee_checkin(transaction):
             if last_log:
                 last_log_type = last_log[0].get("log_type")
                 # Safely convert to datetime to avoid string attribute errors
-                from frappe.utils import get_datetime
                 last_log_time = get_datetime(last_log[0].get("time"))
                 
                 # If last log was on the same day, alternate the state
