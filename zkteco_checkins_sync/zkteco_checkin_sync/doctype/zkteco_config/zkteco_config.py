@@ -305,6 +305,21 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
         return []
 
 
+def create_debug_log(message):
+    """Create Integration Log entry for debugging"""
+    try:
+        frappe.get_doc({
+            "doctype": "Integration Log",
+            "response": message
+        }).insert(ignore_permissions=True)
+
+        frappe.db.commit()
+
+    except Exception:
+        frappe.log_error(str(e), "Integration Log Debug Error")
+
+
+
 def create_employee_checkin(transaction):
     """
     Create Employee Checkin record from ZKTeco transaction
@@ -407,7 +422,7 @@ Previous Log Type   : {last_log[0].get("log_type")}
             debug_message += "\n=================================================="
 
             # Using positional arguments for cross-version compatibility
-            frappe.log_error(debug_message, "ZKTeco Complete Debug")
+            create_debug_log(debug_message)
 
         except Exception as debug_error:
             frappe.log_error(str(debug_error), "ZKTeco Debug Error")             
@@ -421,6 +436,7 @@ Previous Log Type   : {last_log[0].get("log_type")}
         })
         
         if existing_checkin:
+            create_debug_log(f"Duplicate Employee Checkin | Emp: {employee} | Time: {punch_datetime} | Device: {device_id} | State: {punch_state} | Disp: {punch_state_display} | Txn: {transaction_id} | Raw: {frappe.as_json(transaction)}")
             return True  # Already processed
         
         # Also check by transaction ID if we store it
@@ -445,14 +461,24 @@ Previous Log Type   : {last_log[0].get("log_type")}
         try:
             debug_msg = f"Emp: {employee}, Time: {punch_datetime}, State: {punch_state}, Disp: {punch_state_display}, LogType: {log_type}"
             if 'last_log' in locals() and last_log:
-                debug_msg += f"\n  -> Last Log: {last_log[0].get('time')} - {last_log[0].get('log_type')}"
-            frappe.log_error(message=debug_msg, title="ZKTeco Checkin Debug")
-        except Exception:
-            pass
+                debug_msg += ( f"\n  -> Last Log: {last_log[0].get('time')} - {last_log[0].get('log_type')}")
+            create_debug_log(debug_msg)
+        except Exception as e:
+            create_debug_log(f"Debug Logging Error: {str(e)}")
         # ---------------------
         
         checkin.insert(ignore_permissions=True)
         frappe.db.commit()
+        create_debug_log(f"""
+        Employee Checkin Created Successfully
+
+        Employee : {employee}
+        Time     : {punch_datetime}
+        Log Type : {log_type}
+
+        Raw:
+        {frappe.as_json(transaction)}
+        """)
         
         return True
         
