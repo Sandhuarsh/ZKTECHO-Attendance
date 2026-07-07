@@ -10,9 +10,23 @@ from frappe.utils import today, now_datetime, get_datetime, flt
 from datetime import datetime, timedelta
 import json
 
+# PATCH: overlap window (hours) re-fetched on every sync so punches that
+# reach EasyTime late (offline devices) are still picked up. Dedup below
+# prevents duplicates.
+SYNC_OVERLAP_HOURS = 24
+
 
 class ZKTecoConfig(Document):
     pass
+
+
+def debug_enabled():
+    """PATCH: debug logging is opt-in. Add a Check field 'enable_debug_log'
+    to ZKTeco Config to turn it on. Missing field -> None -> disabled."""
+    try:
+        return bool(frappe.db.get_single_value("ZKTeco Config", "enable_debug_log"))
+    except Exception:
+        return False
 
 
 @frappe.whitelist()
@@ -80,7 +94,7 @@ def test_connection():
     token = (cfg.token or "").strip()
     server_ip = frappe.db.get_single_value("ZKTeco Config", "server_ip")
     server_port = frappe.db.get_single_value("ZKTeco Config", "server_port")
-    
+
     if not token:
         return {"ok": False, "error": _("Token not set in ZKTeco Config. Please register/save a token first.")}
 
@@ -100,15 +114,15 @@ def test_connection():
 
     try:
         resp = requests.get(base_url, headers=headers, params=params, timeout=15)
-        
+
         if resp.ok:
             try:
                 data = resp.json()
-                
+
                 # Process and format transaction data for display
                 formatted_transactions = []
                 transaction_count = 0
-                
+
                 # Handle ZKTeco API response structure
                 if isinstance(data, dict) and 'data' in data:
                     transactions = data['data']
@@ -121,7 +135,7 @@ def test_connection():
                     transaction_count = len(transactions)
                 else:
                     transactions = []
-                
+
                 # Format latest 5 transactions for preview
                 for transaction in transactions[:5]:
                     try:
@@ -134,31 +148,31 @@ def test_connection():
                         first_name = transaction.get('first_name', '')
                         last_name = transaction.get('last_name', '') or ''
                         verify_type_display = transaction.get('verify_type_display')
-                        
+
                         # Combine first and last name
                         zkteco_name = f"{first_name} {last_name}".strip()
-                        
+
                         # Try to find employee name from ERPNext
                         employee_name = zkteco_name
                         erpnext_employee = None
                         if emp_code:
                             # Try to find employee by employee_id or user_id
-                            employee = frappe.db.get_value("Employee", 
-                                                         {"employee": emp_code}, 
+                            employee = frappe.db.get_value("Employee",
+                                                         {"employee": emp_code},
                                                          ["name", "employee_name"])
                             if not employee:
-                                employee = frappe.db.get_value("Employee", 
-                                                             {"user_id": emp_code}, 
+                                employee = frappe.db.get_value("Employee",
+                                                             {"user_id": emp_code},
                                                              ["name", "employee_name"])
                             if employee:
                                 erpnext_employee = employee[0] if isinstance(employee, tuple) else employee
                                 employee_name = f"{employee[1]} (ERPNext)" if isinstance(employee, tuple) else f"{employee} (ERPNext)"
-                        
+
                         # Determine log type based on punch_state
                         log_type = "IN"
                         if punch_state == "1" or punch_state_display == "Check Out":
                             log_type = "OUT"
-                        
+
                         formatted_transactions.append({
                             "id": transaction.get('id'),
                             "employee_code": emp_code,
@@ -176,7 +190,7 @@ def test_connection():
                     except Exception as e:
                         frappe.log_error(f"Error processing transaction: {e}", "ZKTeco Transaction Processing")
                         continue
-                
+
                 return {
                     "ok": True,
                     "status_code": resp.status_code,
@@ -186,7 +200,7 @@ def test_connection():
                     "raw_sample": transactions[:2] if transactions else [],
                     "message": f"Found {transaction_count} transactions for {day}"
                 }
-                
+
             except json.JSONDecodeError as e:
                 return {
                     "ok": False,
@@ -201,7 +215,7 @@ def test_connection():
                 "url": resp.url,
                 "error": f"HTTP {resp.status_code}: {resp.text[:200]}"
             }
-            
+
     except requests.RequestException as e:
         return {
             "ok": False,
@@ -218,11 +232,11 @@ def sync_zkteco_transactions():
     if not cfg.enable_sync:
         frappe.log_error("ZKTeco sync is disabled", "ZKTeco Sync")
         return
-    
+
     if not cfg.token:
         frappe.log_error("ZKTeco token not configured", "ZKTeco Sync")
         return
-    
+
     try:
         # Get transactions from last sync or last hour
         last_sync = frappe.db.get_single_value("ZKTeco Config", "last_sync")
@@ -236,12 +250,21 @@ def sync_zkteco_transactions():
             if last_sync.year < 2000:
                 last_sync = current_time - timedelta(days=1)
 
-        transactions = fetch_zkteco_transactions(cfg, last_sync, current_time)
-        
+        # PATCH: re-fetch an overlap window so punches synced late by the
+        # device (offline periods) are not permanently missed. Dedup in
+        # create_employee_checkin prevents duplicates.
+        fetch_from = last_sync - timedelta(hours=SYNC_OVERLAP_HOURS)
+
+        transactions = fetch_zkteco_transactions(cfg, fetch_from, current_time)
+
         if transactions:
+            # PATCH: process in chronological order so the alternating
+            # IN/OUT fallback for punch_state 255 works deterministically.
+            transactions.sort(key=lambda t: str(t.get("punch_time") or ""))
+
             processed_count = 0
             error_count = 0
-            
+
             for transaction in transactions:
                 try:
                     if create_employee_checkin(transaction):
@@ -251,15 +274,15 @@ def sync_zkteco_transactions():
                 except Exception as e:
                     error_count += 1
                     frappe.log_error(f"Error creating checkin for transaction {transaction}: {str(e)}", "ZKTeco Sync Error")
-            
+
             # Update last sync time and record count
             total_synced = frappe.db.get_single_value("ZKTeco Config", "total_synced_records") or 0
             frappe.db.set_single_value("ZKTeco Config", "last_sync", current_time)
             frappe.db.set_single_value("ZKTeco Config", "total_synced_records", total_synced + processed_count)
             frappe.db.commit()
-            
+
             frappe.logger().info(f"ZKTeco Sync completed: {processed_count} processed, {error_count} errors")
-        
+
     except Exception as e:
         frappe.log_error(f"ZKTeco sync failed: {str(e)}", "ZKTeco Sync Fatal Error")
 
@@ -271,25 +294,25 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
     server_ip = cfg.server_ip
     server_port = cfg.server_port
     token = cfg.token
-    
+
     base_url = f"http://{server_ip}:{server_port}/iclock/api/transactions/"
-    
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Token {token}",
     }
-    
+
     params = {
         "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    
+
     try:
         resp = requests.get(base_url, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
-        
+
         data = resp.json()
-        
+
         # Handle ZKTeco API response format
         if isinstance(data, dict) and 'data' in data:
             return data['data']
@@ -299,25 +322,28 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
             return data
         else:
             return []
-            
+
     except Exception as e:
         frappe.log_error(f"Failed to fetch ZKTeco transactions: {str(e)}", "ZKTeco API Error")
         return []
 
 
 def create_debug_log(message):
-    """Create Integration Log entry for debugging"""
+    """Create Integration Log entry for debugging.
+
+    PATCH: never raises (a debug-log failure must not block punch
+    creation), and only writes when enable_debug_log is on."""
+    if not debug_enabled():
+        return
     try:
         doc = frappe.get_doc({
             "doctype": "Integration Log",
             "response": message
         })
         doc.insert(ignore_permissions=True)
-        frappe.db.commit()
 
-    except Exception as e:
+    except Exception:
         frappe.log_error(frappe.get_traceback(), "Integration Log Debug Error")
-        raise
 
 
 def create_employee_checkin(transaction):
@@ -333,29 +359,36 @@ def create_employee_checkin(transaction):
         device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
         transaction_id = transaction.get('id')
 
-        
-        
         if not emp_code or not punch_time:
             frappe.log_error(f"Missing required fields in transaction: {transaction}", "ZKTeco Transaction Error")
             return False
-        
+
         # Find employee
         employee = find_employee_by_code(emp_code)
         if not employee:
             frappe.log_error(f"Employee not found for code: {emp_code}", "ZKTeco Employee Mapping")
             return False
-        
+
         # Convert punch_time to datetime
         if isinstance(punch_time, str):
             punch_datetime = get_datetime(punch_time)
         else:
             punch_datetime = punch_time
-        
+
+        # PATCH: compose the stored device_id ONCE and use the same value
+        # for both dedup and insert (previously dedup checked the raw
+        # device_id while insert stored a modified one, so dedup never hit).
+        stored_device_id = (
+            f"{device_id} (ZKTeco-{transaction_id})"
+            if transaction_id
+            else device_id or "ZKTeco Device"
+        )
+
         # Determine log type based on punch_state
         # 1. Start by assuming IN by default
         log_type = "IN"
         punch_display_lower = str(punch_state_display).strip().lower() if punch_state_display else ""
-        
+
         # If punch_state is 255, we should ignore display and use fallback alternating logic
         if str(punch_state) != "255" and (str(punch_state) == "1" or punch_display_lower in ["check out", "out", "checkout"]):
             log_type = "OUT"
@@ -364,18 +397,18 @@ def create_employee_checkin(transaction):
         else:
             # Fallback for state 255 or unknown: alternate based on previous checkin today
             last_log = frappe.db.get_all(
-                "Employee Checkin", 
-                filters={"employee": employee, "time": ["<", punch_datetime]}, 
-                fields=["log_type", "time"], 
-                order_by="time desc", 
+                "Employee Checkin",
+                filters={"employee": employee, "time": ["<", punch_datetime]},
+                fields=["log_type", "time"],
+                order_by="time desc",
                 limit=1
             )
-            
+
             if last_log:
                 last_log_type = last_log[0].get("log_type")
                 # Safely convert to datetime to avoid string attribute errors
                 last_log_time = get_datetime(last_log[0].get("time"))
-                
+
                 # If last log was on the same day, alternate the state
                 if last_log_time.date() == punch_datetime.date():
                     if last_log_type == "IN":
@@ -424,48 +457,69 @@ Previous Log Type   : {last_log[0].get("log_type")}
             create_debug_log(debug_message)
 
         except Exception as debug_error:
-            frappe.log_error(str(debug_error), "ZKTeco Debug Error")             
+            frappe.log_error(str(debug_error), "ZKTeco Debug Error")
 
-        
         # Check if checkin already exists (use transaction ID for uniqueness)
+        # PATCH: compare against stored_device_id (same value as insert)
         existing_checkin = frappe.db.exists("Employee Checkin", {
             "employee": employee,
             "time": punch_datetime,
-            "device_id": device_id
+            "device_id": stored_device_id
         })
-        
+
         if existing_checkin:
-            create_debug_log(f"Duplicate Employee Checkin | Emp: {employee} | Time: {punch_datetime} | Device: {device_id} | State: {punch_state} | Disp: {punch_state_display} | Txn: {transaction_id} | Raw: {frappe.as_json(transaction)}")
+            create_debug_log(f"Duplicate Employee Checkin | Emp: {employee} | Time: {punch_datetime} | Device: {stored_device_id} | State: {punch_state} | Disp: {punch_state_display} | Txn: {transaction_id} | Raw: {frappe.as_json(transaction)}")
             return True  # Already processed
-        
-        # Also check by transaction ID if we store it
-        if transaction_id:
-            existing_by_id = frappe.db.get_value("Employee Checkin", 
-                                               {"device_id": device_id, "employee": employee}, 
-                                               "name", 
-                                               {"time": ["between", [punch_datetime - timedelta(seconds=5), punch_datetime + timedelta(seconds=5)]]})
-            if existing_by_id:
-                return True
-        
+
+        # PATCH: time-window dedup — the between filter now lives inside
+        # filters (previously passed as a positional arg and ignored).
+        # Catches the same punch re-fetched with second-level jitter.
+        existing_nearby = frappe.db.get_value(
+            "Employee Checkin",
+            {
+                "employee": employee,
+                "device_id": stored_device_id,
+                "time": ["between", [
+                    punch_datetime - timedelta(seconds=5),
+                    punch_datetime + timedelta(seconds=5)
+                ]]
+            },
+            "name"
+        )
+        if existing_nearby:
+            return True
+
         # Create Employee Checkin
         checkin = frappe.get_doc({
             "doctype": "Employee Checkin",
             "employee": employee,
             "time": punch_datetime,
             "log_type": log_type,
-            "device_id": f"{device_id} (ZKTeco-{transaction_id})" if transaction_id else device_id or "ZKTeco Device",
+            "device_id": stored_device_id,
             "skip_auto_attendance": 0
         })
+
+        # PATCH: explicitly resolve shift fields before insert so the
+        # checkin lands with shift / shift_actual_start / shift_actual_end
+        # populated and auto attendance can pick it up.
+        try:
+            checkin.fetch_shift()
+        except Exception as e:
+            frappe.log_error(
+                f"fetch_shift failed | Emp: {employee} | Time: {punch_datetime} | {str(e)}",
+                "ZKTeco Shift Fetch"
+            )
+
         # --- DEBUG LOGGING ---
         try:
-            debug_msg = f"Emp: {employee}, Time: {punch_datetime}, State: {punch_state}, Disp: {punch_state_display}, LogType: {log_type}"
+            debug_msg = f"Emp: {employee}, Time: {punch_datetime}, State: {punch_state}, Disp: {punch_state_display}, LogType: {log_type}, Shift: {checkin.shift}"
             if 'last_log' in locals() and last_log:
-                debug_msg += ( f"\n  -> Last Log: {last_log[0].get('time')} - {last_log[0].get('log_type')}")
+                debug_msg += (f"\n  -> Last Log: {last_log[0].get('time')} - {last_log[0].get('log_type')}")
             create_debug_log(debug_msg)
         except Exception as e:
             create_debug_log(f"Debug Logging Error: {str(e)}")
         # ---------------------
-        
+
         checkin.insert(ignore_permissions=True)
         frappe.db.commit()
         create_debug_log(f"""
@@ -474,13 +528,14 @@ Previous Log Type   : {last_log[0].get("log_type")}
         Employee : {employee}
         Time     : {punch_datetime}
         Log Type : {log_type}
+        Shift    : {checkin.shift}
 
         Raw:
         {frappe.as_json(transaction)}
         """)
-        
+
         return True
-        
+
     except Exception as e:
         frappe.log_error(f"Error creating Employee Checkin: {str(e)}", "ZKTeco Checkin Creation")
         return False
@@ -553,23 +608,23 @@ def scheduled_sync():
         cfg = frappe.get_single("ZKTeco Config")
         if not cfg.enable_sync:
             return
-            
+
         # For frequent syncs (less than 60 seconds), check if we should actually run
         sync_seconds = int(cfg.seconds or 300)
         if sync_seconds < 60:
             last_run = frappe.cache().get_value("zkteco_last_sync_run")
             current_time = now_datetime()
-            
+
             if last_run:
                 time_diff = (current_time - get_datetime(last_run)).total_seconds()
                 if time_diff < sync_seconds:
                     return  # Not yet time for next sync
-            
+
             # Update last run time
             frappe.cache().set_value("zkteco_last_sync_run", current_time)
-        
+
         sync_zkteco_transactions()
-        
+
     except Exception as e:
         frappe.log_error(f"Scheduled ZKTeco sync failed: {str(e)}", "ZKTeco Scheduled Sync Error")
 
@@ -594,16 +649,16 @@ def get_sync_status():
     """
     try:
         cfg = frappe.get_single("ZKTeco Config")
-        
+
         # Get last sync time
         last_sync = frappe.db.get_single_value("ZKTeco Config", "last_sync")
-        
+
         # Count recent employee checkins from ZKTeco
         recent_checkins = frappe.db.count("Employee Checkin", {
             "device_id": ["like", "%ZKTeco%"],
             "creation": [">=", frappe.utils.add_days(today(), -1)]
         })
-        
+
         return {
             "enabled": cfg.enable_sync,
             "sync_frequency": cfg.seconds,
@@ -612,6 +667,6 @@ def get_sync_status():
             "server_configured": bool(cfg.server_ip and cfg.server_port),
             "token_configured": bool(cfg.token)
         }
-        
+
     except Exception as e:
         return {"error": str(e)}
