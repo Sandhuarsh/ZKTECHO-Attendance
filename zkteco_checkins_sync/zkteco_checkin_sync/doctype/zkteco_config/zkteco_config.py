@@ -10,23 +10,14 @@ from frappe.utils import today, now_datetime, get_datetime, flt
 from datetime import datetime, timedelta
 import json
 
-# PATCH: overlap window (hours) re-fetched on every sync so punches that
-# reach EasyTime late (offline devices) are still picked up. Dedup below
-# prevents duplicates.
+# Overlap window (hours) re-fetched on every sync so punches that reach
+# EasyTime late (offline devices) are still picked up. Dedup prevents
+# duplicates.
 SYNC_OVERLAP_HOURS = 24
 
 
 class ZKTecoConfig(Document):
     pass
-
-
-def debug_enabled():
-    """PATCH: debug logging is opt-in. Add a Check field 'enable_debug_log'
-    to ZKTeco Config to turn it on. Missing field -> None -> disabled."""
-    try:
-        return bool(frappe.db.get_single_value("ZKTeco Config", "enable_debug_log"))
-    except Exception:
-        return False
 
 
 @frappe.whitelist()
@@ -54,11 +45,6 @@ def register_api_token():
                 "password": password
             },
             timeout=15
-        )
-
-        frappe.logger().info(
-            f"ZKTeco Login URL: {login_url}\n"
-            f"Response: {response.status_code} - {response.text}"
         )
 
         if response.status_code != 200:
@@ -230,7 +216,6 @@ def sync_zkteco_transactions():
     # Check if sync is enabled
     cfg = frappe.get_single("ZKTeco Config")
     if not cfg.enable_sync:
-        frappe.log_error("ZKTeco sync is disabled", "ZKTeco Sync")
         return
 
     if not cfg.token:
@@ -238,7 +223,7 @@ def sync_zkteco_transactions():
         return
 
     try:
-        # Get transactions from last sync or last hour
+        # Get transactions from last sync or last day
         last_sync = frappe.db.get_single_value("ZKTeco Config", "last_sync")
         current_time = now_datetime()
 
@@ -250,16 +235,15 @@ def sync_zkteco_transactions():
             if last_sync.year < 2000:
                 last_sync = current_time - timedelta(days=1)
 
-        # PATCH: re-fetch an overlap window so punches synced late by the
-        # device (offline periods) are not permanently missed. Dedup in
-        # create_employee_checkin prevents duplicates.
+        # Re-fetch an overlap window so punches synced late by the device
+        # (offline periods) are not permanently missed.
         fetch_from = last_sync - timedelta(hours=SYNC_OVERLAP_HOURS)
 
         transactions = fetch_zkteco_transactions(cfg, fetch_from, current_time)
 
         if transactions:
-            # PATCH: process in chronological order so the alternating
-            # IN/OUT fallback for punch_state 255 works deterministically.
+            # Process in chronological order so the alternating IN/OUT
+            # fallback for punch_state 255 works deterministically.
             transactions.sort(key=lambda t: str(t.get("punch_time") or ""))
 
             processed_count = 0
@@ -280,8 +264,6 @@ def sync_zkteco_transactions():
             frappe.db.set_single_value("ZKTeco Config", "last_sync", current_time)
             frappe.db.set_single_value("ZKTeco Config", "total_synced_records", total_synced + processed_count)
             frappe.db.commit()
-
-            frappe.logger().info(f"ZKTeco Sync completed: {processed_count} processed, {error_count} errors")
 
     except Exception as e:
         frappe.log_error(f"ZKTeco sync failed: {str(e)}", "ZKTeco Sync Fatal Error")
@@ -328,24 +310,6 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
         return []
 
 
-def create_debug_log(message):
-    """Create Integration Log entry for debugging.
-
-    PATCH: never raises (a debug-log failure must not block punch
-    creation), and only writes when enable_debug_log is on."""
-    if not debug_enabled():
-        return
-    try:
-        doc = frappe.get_doc({
-            "doctype": "Integration Log",
-            "response": message
-        })
-        doc.insert(ignore_permissions=True)
-
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Integration Log Debug Error")
-
-
 def create_employee_checkin(transaction):
     """
     Create Employee Checkin record from ZKTeco transaction
@@ -375,9 +339,8 @@ def create_employee_checkin(transaction):
         else:
             punch_datetime = punch_time
 
-        # PATCH: compose the stored device_id ONCE and use the same value
-        # for both dedup and insert (previously dedup checked the raw
-        # device_id while insert stored a modified one, so dedup never hit).
+        # Compose the stored device_id once and use the same value for
+        # both dedup and insert.
         stored_device_id = (
             f"{device_id} (ZKTeco-{transaction_id})"
             if transaction_id
@@ -385,11 +348,10 @@ def create_employee_checkin(transaction):
         )
 
         # Determine log type based on punch_state
-        # 1. Start by assuming IN by default
         log_type = "IN"
         punch_display_lower = str(punch_state_display).strip().lower() if punch_state_display else ""
 
-        # If punch_state is 255, we should ignore display and use fallback alternating logic
+        # If punch_state is 255, ignore display and use fallback alternating logic
         if str(punch_state) != "255" and (str(punch_state) == "1" or punch_display_lower in ["check out", "out", "checkout"]):
             log_type = "OUT"
         elif str(punch_state) != "255" and (str(punch_state) == "0" or punch_display_lower in ["check in", "in", "checkin"]):
@@ -406,7 +368,6 @@ def create_employee_checkin(transaction):
 
             if last_log:
                 last_log_type = last_log[0].get("log_type")
-                # Safely convert to datetime to avoid string attribute errors
                 last_log_time = get_datetime(last_log[0].get("time"))
 
                 # If last log was on the same day, alternate the state
@@ -415,52 +376,8 @@ def create_employee_checkin(transaction):
                         log_type = "OUT"
                     else:
                         log_type = "IN"
-        try:
-            debug_message = f"""
-================== ZKTeco Debug ==================
 
-RAW TRANSACTION
----------------
-{frappe.as_json(transaction)}
-
-PARSED VALUES
--------------
-Employee Code       : {emp_code}
-Employee            : {employee}
-Punch Time          : {punch_time}
-Punch Datetime      : {punch_datetime}
-Punch State         : {punch_state}
-Punch State Display : {punch_state_display}
-Device ID           : {device_id}
-Transaction ID      : {transaction_id}
-
-LOGIC RESULT
-------------
-Punch Display Lower : {punch_display_lower}
-Selected Log Type   : {log_type}
-
-LAST CHECKIN
-------------
-"""
-
-            if 'last_log' in locals() and last_log:
-                debug_message += f"""
-Previous Time       : {last_log[0].get("time")}
-Previous Log Type   : {last_log[0].get("log_type")}
-"""
-            else:
-                debug_message += "No previous checkin found.\n"
-
-            debug_message += "\n=================================================="
-
-            # Using positional arguments for cross-version compatibility
-            create_debug_log(debug_message)
-
-        except Exception as debug_error:
-            frappe.log_error(str(debug_error), "ZKTeco Debug Error")
-
-        # Check if checkin already exists (use transaction ID for uniqueness)
-        # PATCH: compare against stored_device_id (same value as insert)
+        # Exact-match dedup
         existing_checkin = frappe.db.exists("Employee Checkin", {
             "employee": employee,
             "time": punch_datetime,
@@ -468,12 +385,10 @@ Previous Log Type   : {last_log[0].get("log_type")}
         })
 
         if existing_checkin:
-            create_debug_log(f"Duplicate Employee Checkin | Emp: {employee} | Time: {punch_datetime} | Device: {stored_device_id} | State: {punch_state} | Disp: {punch_state_display} | Txn: {transaction_id} | Raw: {frappe.as_json(transaction)}")
             return True  # Already processed
 
-        # PATCH: time-window dedup — the between filter now lives inside
-        # filters (previously passed as a positional arg and ignored).
-        # Catches the same punch re-fetched with second-level jitter.
+        # Time-window dedup: catches the same punch re-fetched with
+        # second-level jitter.
         existing_nearby = frappe.db.get_value(
             "Employee Checkin",
             {
@@ -499,8 +414,8 @@ Previous Log Type   : {last_log[0].get("log_type")}
             "skip_auto_attendance": 0
         })
 
-        # PATCH: explicitly resolve shift fields before insert so the
-        # checkin lands with shift / shift_actual_start / shift_actual_end
+        # Explicitly resolve shift fields before insert so the checkin
+        # lands with shift / shift_actual_start / shift_actual_end
         # populated and auto attendance can pick it up.
         try:
             checkin.fetch_shift()
@@ -510,29 +425,8 @@ Previous Log Type   : {last_log[0].get("log_type")}
                 "ZKTeco Shift Fetch"
             )
 
-        # --- DEBUG LOGGING ---
-        try:
-            debug_msg = f"Emp: {employee}, Time: {punch_datetime}, State: {punch_state}, Disp: {punch_state_display}, LogType: {log_type}, Shift: {checkin.shift}"
-            if 'last_log' in locals() and last_log:
-                debug_msg += (f"\n  -> Last Log: {last_log[0].get('time')} - {last_log[0].get('log_type')}")
-            create_debug_log(debug_msg)
-        except Exception as e:
-            create_debug_log(f"Debug Logging Error: {str(e)}")
-        # ---------------------
-
         checkin.insert(ignore_permissions=True)
         frappe.db.commit()
-        create_debug_log(f"""
-        Employee Checkin Created Successfully
-
-        Employee : {employee}
-        Time     : {punch_datetime}
-        Log Type : {log_type}
-        Shift    : {checkin.shift}
-
-        Raw:
-        {frappe.as_json(transaction)}
-        """)
 
         return True
 
@@ -579,10 +473,6 @@ def find_employee_by_code(emp_code):
     )
     if employee:
         return employee
-
-    frappe.logger().info(
-        f"Employee mapping not found for emp_code: {emp_code}"
-    )
 
     return None
 
@@ -633,13 +523,7 @@ def cleanup_scheduler_check():
     """
     Cleanup function to ensure scheduler is working properly
     """
-    try:
-        cfg = frappe.get_single("ZKTeco Config")
-        if cfg.enable_sync:
-            # Log that the scheduler is active
-            frappe.logger().info("ZKTeco scheduler check: Active")
-    except Exception as e:
-        frappe.log_error(f"ZKTeco scheduler check failed: {str(e)}", "ZKTeco Scheduler Check")
+    pass
 
 
 @frappe.whitelist()
