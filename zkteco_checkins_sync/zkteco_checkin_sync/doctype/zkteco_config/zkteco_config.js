@@ -99,6 +99,47 @@ frappe.ui.form.on("ZKTeco Config", {
                 indicator: "red"
             });
         });
+    },
+
+    manual_pull_range(frm) {
+        if (!frm.doc.start_date || !frm.doc.end_date) {
+            frappe.show_alert({
+                message: __('❌ Please select both Start Date and End Date'),
+                indicator: 'red'
+            });
+            return;
+        }
+
+        frappe.call({
+            method: "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.manual_pull_by_date_range",
+            freeze: true,
+            freeze_message: __("Pulling transactions for date range...")
+        }).then((r) => {
+            const result = r.message || {};
+            if (result.success) {
+                frappe.msgprint({
+                    title: __("Date Range Pull Completed"),
+                    message: `✅ <strong>Success!</strong><br>
+                             📊 Processed: ${result.processed || 0}<br>
+                             ⏭️ Skipped (Already Synced): ${result.skipped || 0}<br>
+                             ❌ Errors: ${result.errors || 0}<br>
+                             📈 Total Transactions: ${result.total || 0}`,
+                    indicator: "green"
+                });
+                frm.reload_doc();
+            } else {
+                frappe.show_alert({
+                    message: __(`❌ Pull failed: ${result.message || 'Unknown error'}`),
+                    indicator: 'red'
+                });
+            }
+        }).catch((e) => {
+            frappe.msgprint({
+                title: __("Pull Error"),
+                message: `<pre style="white-space:pre-wrap; color: red;">${frappe.utils.escape_html(e.message || e)}</pre>`,
+                indicator: "red"
+            });
+        });
     }
 });
 
@@ -195,13 +236,25 @@ function show_sync_status(frm) {
         if (status.error) {
             html += `<div style="color: red;">❌ Error: ${status.error}</div>`;
         } else {
+            // Determine status indicator color
+            let statusColor = 'orange';
+            if (status.last_sync_status === 'Success') statusColor = 'green';
+            else if (status.last_sync_status === 'Failed') statusColor = 'red';
+            else if (status.last_sync_status === 'Retrying') statusColor = 'blue';
+            
             html += `<table class="table table-bordered">
                         <tr><td><strong>Sync Enabled:</strong></td><td>${status.enabled ? '✅ Yes' : '❌ No'}</td></tr>
                         <tr><td><strong>Sync Frequency:</strong></td><td>Every ${status.sync_frequency || 'N/A'} seconds</td></tr>
                         <tr><td><strong>Last Sync:</strong></td><td>${status.last_sync || 'Never'}</td></tr>
+                        <tr><td><strong>Last Sync Status:</strong></td><td><span style="color: ${statusColor === 'green' ? 'green' : statusColor === 'red' ? 'red' : statusColor === 'blue' ? 'blue' : 'orange'};">● ${status.last_sync_status || 'Never'}</span></td></tr>
+                        <tr><td><strong>Failed Attempts:</strong></td><td>${status.failed_attempts || 0}</td></tr>
                         <tr><td><strong>Recent Check-ins (24h):</strong></td><td>${status.recent_checkins_24h || 0}</td></tr>
                         <tr><td><strong>Server Configured:</strong></td><td>${status.server_configured ? '✅ Yes' : '❌ No'}</td></tr>
                         <tr><td><strong>Token Configured:</strong></td><td>${status.token_configured ? '✅ Yes' : '❌ No'}</td></tr>
+                        <tr style="background-color: #f0f0f0;"><td colspan="2"><strong>Retry Mechanism</strong></td></tr>
+                        <tr><td><strong>Retry on Failure:</strong></td><td>${status.retry_enabled ? '✅ Enabled' : '❌ Disabled'}</td></tr>
+                        <tr><td><strong>Max Retry Attempts:</strong></td><td>${status.max_retry_attempts || 'N/A'}</td></tr>
+                        <tr><td><strong>Retry Interval:</strong></td><td>${status.retry_interval || 'N/A'} seconds</td></tr>
                      </table>`;
         }
         
@@ -218,13 +271,15 @@ function show_sync_status(frm) {
 function show_sync_indicator(frm) {
     const sync_frequency = frm.doc.seconds;
     const token_configured = frm.doc.token ? true : false;
+    const retry_enabled = frm.doc.enable_retry_on_failure ? true : false;
     
     let indicator_color = 'red';
     let indicator_text = 'Sync Disabled';
     
     if (frm.doc.enable_sync && token_configured) {
         indicator_color = 'green';
-        indicator_text = `Sync Active (${sync_frequency}s)`;
+        let retryInfo = retry_enabled ? ` | Retry: ${frm.doc.max_retry_attempts}x` : '';
+        indicator_text = `Sync Active (${sync_frequency}s${retryInfo})`;
     } else if (frm.doc.enable_sync) {
         indicator_color = 'orange';
         indicator_text = 'Sync Enabled (Token Missing)';
