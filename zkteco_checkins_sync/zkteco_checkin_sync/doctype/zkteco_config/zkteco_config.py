@@ -15,6 +15,40 @@ class ZKTecoConfig(Document):
     pass
 
 
+def log_integration_request(title, status, response=None, error=None, details=None):
+    """
+    Create an Integration Log entry for tracking all API requests and responses
+    """
+    try:
+        log_message = f"Status: {status}\n"
+        
+        if response:
+            log_message += f"Response: {json.dumps(response, indent=2, default=str)}\n"
+        
+        if error:
+            log_message += f"Error: {error}\n"
+        
+        if details:
+            log_message += f"Details: {json.dumps(details, indent=2, default=str)}\n"
+        
+        # Create Integration Log entry
+        log_doc = frappe.get_doc({
+            "doctype": "Integration Log",
+            "reference_doctype": "ZKTeco Config",
+            "reference_name": frappe.get_single("ZKTeco Config").name,
+            "method": title,
+            "status": status,
+            "request_headers": json.dumps({"Authorization": "Token ***"}),
+            "response": log_message,
+            "error": error or ""
+        })
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        
+    except Exception as e:
+        frappe.logger().error(f"Failed to create integration log: {str(e)}")
+
+
 @frappe.whitelist()
 def register_api_token():
     """
@@ -28,7 +62,9 @@ def register_api_token():
     password = cfg.get_password("password")
 
     if not all([server_ip, server_port, username, password]):
-        frappe.throw(_("Please configure server IP, port, username, and password."))
+        error_msg = _("Please configure server IP, port, username, and password.")
+        log_integration_request("register_api_token", "Failed", error=str(error_msg))
+        frappe.throw(error_msg)
 
     login_url = f"http://{server_ip}:{server_port}/api-token-auth/"
 
@@ -48,17 +84,25 @@ def register_api_token():
         )
 
         if response.status_code != 200:
-            frappe.throw(_("Login Failed: {0}").format(response.text))
+            error_msg = f"Login Failed: {response.text}"
+            log_integration_request("register_api_token", "Failed", error=error_msg)
+            frappe.throw(_(error_msg))
 
         data = response.json()
         token = data.get("token")
 
         if not token:
-            frappe.throw(_("Token not found: {0}").format(response.text))
+            error_msg = f"Token not found: {response.text}"
+            log_integration_request("register_api_token", "Failed", error=error_msg)
+            frappe.throw(_(error_msg))
 
         # Save DRF token directly
         frappe.db.set_single_value("ZKTeco Config", "token", token)
         frappe.db.commit()
+
+        log_integration_request("register_api_token", "Success", 
+                              response={"token": token[:20] + "***"}, 
+                              details={"status_code": response.status_code})
 
         return {
             "success": True,
@@ -67,7 +111,9 @@ def register_api_token():
         }
 
     except requests.exceptions.RequestException as e:
-        frappe.throw(_("Connection error: {0}").format(str(e)))
+        error_msg = f"Connection error: {str(e)}"
+        log_integration_request("register_api_token", "Failed", error=error_msg)
+        frappe.throw(_(error_msg))
 
 
 @frappe.whitelist()
@@ -82,7 +128,9 @@ def test_connection():
     server_port = frappe.db.get_single_value("ZKTeco Config", "server_port")
     
     if not token:
-        return {"ok": False, "error": _("Token not set in ZKTeco Config. Please register/save a token first.")}
+        error_msg = _("Token not set in ZKTeco Config. Please register/save a token first.")
+        log_integration_request("test_connection", "Failed", error=str(error_msg))
+        return {"ok": False, "error": error_msg}
 
     base_url = f"http://{server_ip}:{server_port}/iclock/api/transactions/"
     day = today()
@@ -96,6 +144,8 @@ def test_connection():
     params = {
         "start_time": start_time,
         "end_time": end_time,
+        "page": 1,
+        "page_size": 5
     }
 
     try:
@@ -115,7 +165,10 @@ def test_connection():
                     transaction_count = data.get('count', len(transactions))
                 elif isinstance(data, dict) and 'results' in data:
                     transactions = data['results']
-                    transaction_count = len(transactions)
+                    transaction_count = data.get('count', len(transactions))
+                elif isinstance(data, dict) and 'count' in data:
+                    transactions = data.get('results', data.get('data', []))
+                    transaction_count = data.get('count', len(transactions))
                 elif isinstance(data, list):
                     transactions = data
                     transaction_count = len(transactions)
@@ -177,7 +230,7 @@ def test_connection():
                         frappe.log_error(f"Error processing transaction: {e}", "ZKTeco Transaction Processing")
                         continue
                 
-                return {
+                result = {
                     "ok": True,
                     "status_code": resp.status_code,
                     "url": resp.url,
@@ -187,26 +240,35 @@ def test_connection():
                     "message": f"Found {transaction_count} transactions for {day}"
                 }
                 
+                log_integration_request("test_connection", "Success", response=result)
+                return result
+                
             except json.JSONDecodeError as e:
-                return {
+                error_dict = {
                     "ok": False,
                     "status_code": resp.status_code,
                     "error": f"Invalid JSON response: {str(e)}",
                     "raw_response": resp.text[:500]
                 }
+                log_integration_request("test_connection", "Failed", error=str(error_dict))
+                return error_dict
         else:
-            return {
+            error_dict = {
                 "ok": False,
                 "status_code": resp.status_code,
                 "url": resp.url,
                 "error": f"HTTP {resp.status_code}: {resp.text[:200]}"
             }
+            log_integration_request("test_connection", "Failed", error=str(error_dict))
+            return error_dict
             
     except requests.RequestException as e:
-        return {
+        error_dict = {
             "ok": False,
             "error": f"Connection error: {str(e)}"
         }
+        log_integration_request("test_connection", "Failed", error=str(error_dict))
+        return error_dict
 
 
 def sync_zkteco_transactions():
@@ -264,10 +326,25 @@ def sync_zkteco_transactions():
             
             frappe.db.commit()
             
-            frappe.logger().info(f"ZKTeco Sync completed: {processed_count} processed, {error_count} errors")
+            sync_details = {
+                "processed": processed_count,
+                "errors": error_count,
+                "total_fetched": len(transactions),
+                "last_sync_time": str(current_time),
+                "sync_period": f"{str(last_sync)} to {str(current_time)}"
+            }
+            
+            log_integration_request("sync_zkteco_transactions", sync_status, 
+                                  response=sync_details)
+            
+            frappe.logger().info(f"ZKTeco Sync completed: {processed_count} processed, {error_count} errors out of {len(transactions)} fetched")
+        else:
+            log_integration_request("sync_zkteco_transactions", "NoData", response={"message": "No transactions found"})
         
     except Exception as e:
         frappe.log_error(f"ZKTeco sync failed: {str(e)}", "ZKTeco Sync Fatal Error")
+        log_integration_request("sync_zkteco_transactions", "Failed", error=str(e))
+        
         # Update failed attempts counter
         failed_attempts = frappe.db.get_single_value("ZKTeco Config", "failed_sync_attempts") or 0
         frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", failed_attempts + 1)
@@ -275,9 +352,10 @@ def sync_zkteco_transactions():
         frappe.db.commit()
 
 
-def fetch_zkteco_transactions(cfg, start_time, end_time):
+def fetch_zkteco_transactions(cfg, start_time, end_time, page=1, page_size=100):
     """
-    Fetch transactions from ZKTeco device
+    Fetch transactions from ZKTeco device with pagination support
+    Returns tuple of (transactions, total_count)
     """
     server_ip = cfg.server_ip
     server_port = cfg.server_port
@@ -293,6 +371,8 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
     params = {
         "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "page": page,
+        "page_size": page_size
     }
     
     try:
@@ -301,49 +381,88 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
         
         data = resp.json()
         
-        # Handle ZKTeco API response format
-        if isinstance(data, dict) and 'data' in data:
-            return data['data']
-        elif isinstance(data, dict) and 'results' in data:
-            return data['results']
+        # Handle ZKTeco API response format - multiple variations
+        if isinstance(data, dict):
+            # Check for 'count' field to get total
+            total_count = data.get('count', 0)
+            
+            # Get transactions from various possible keys
+            if 'data' in data:
+                transactions = data['data']
+            elif 'results' in data:
+                transactions = data['results']
+            else:
+                transactions = data.get('results', [])
+            
+            return transactions, total_count
         elif isinstance(data, list):
-            return data
+            return data, len(data)
         else:
-            return []
+            return [], 0
             
     except Exception as e:
-        frappe.log_error(f"Failed to fetch ZKTeco transactions: {str(e)}", "ZKTeco API Error")
-        return []
+        frappe.log_error(f"Failed to fetch ZKTeco transactions (Page {page}): {str(e)}", "ZKTeco API Error")
+        return [], 0
 
 
 def fetch_zkteco_transactions_with_retry(cfg, start_time, end_time):
     """
-    Fetch transactions from ZKTeco device with retry mechanism
+    Fetch ALL transactions from ZKTeco device with pagination and retry mechanism
     Handles device unavailability gracefully
     """
     max_retries = int(cfg.max_retry_attempts or 3) if cfg.enable_retry_on_failure else 1
     retry_interval = int(cfg.retry_interval_seconds or 60) if cfg.enable_retry_on_failure else 0
     attempt = 0
+    all_transactions = []
+    page_size = 100
+    page = 1
+    total_count = 0
     
     while attempt < max_retries:
         try:
-            transactions = fetch_zkteco_transactions(cfg, start_time, end_time)
-            if transactions:
+            page = 1  # Reset page for this attempt
+            all_transactions = []
+            total_count = 0
+            
+            # Fetch all pages of transactions
+            while True:
+                frappe.logger().info(f"Fetching page {page} (page_size: {page_size}) from {start_time} to {end_time}")
+                
+                transactions, total_count = fetch_zkteco_transactions(cfg, start_time, end_time, page, page_size)
+                
+                if not transactions:
+                    break
+                
+                all_transactions.extend(transactions)
+                frappe.logger().info(f"Fetched page {page}: {len(transactions)} transactions. Total so far: {len(all_transactions)}/{total_count}")
+                
+                # Check if we have fetched all records
+                if len(all_transactions) >= total_count > 0:
+                    frappe.logger().info(f"All {total_count} transactions fetched successfully")
+                    break
+                
+                page += 1
+                # Add small delay between pages to avoid overwhelming the API
+                time.sleep(0.5)
+            
+            # Success - we got all transactions (or no error occurred)
+            if all_transactions or total_count == 0:
                 # Reset failed attempts on successful fetch
                 frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", 0)
                 frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Success")
                 frappe.db.commit()
-                return transactions
-            else:
-                # Empty result but no error - might be no transactions
-                return []
+                
+                log_integration_request("fetch_zkteco_transactions_with_retry", "Success",
+                                      response={"total_fetched": len(all_transactions), "total_available": total_count, 
+                                               "pages_fetched": page - 1})
+                
+                frappe.logger().info(f"Transaction fetch completed: {len(all_transactions)} records fetched")
+                return all_transactions
                 
         except requests.exceptions.ConnectionError as e:
             attempt += 1
-            frappe.log_error(
-                f"ZKTeco device connection failed (Attempt {attempt}/{max_retries}): {str(e)}", 
-                "ZKTeco Connection Error"
-            )
+            error_msg = f"ZKTeco device connection failed (Attempt {attempt}/{max_retries}): {str(e)}"
+            frappe.log_error(error_msg, "ZKTeco Connection Error")
             
             if attempt < max_retries and cfg.enable_retry_on_failure:
                 frappe.logger().info(f"Retrying in {retry_interval} seconds...")
@@ -356,6 +475,7 @@ def fetch_zkteco_transactions_with_retry(cfg, start_time, end_time):
                 frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Failed")
                 frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", attempt)
                 frappe.db.commit()
+                log_integration_request("fetch_zkteco_transactions_with_retry", "Failed", error=error_msg)
                 frappe.log_error(
                     f"ZKTeco device unavailable after {max_retries} attempts. Will retry on next scheduled sync.", 
                     "ZKTeco Device Unavailable"
@@ -364,28 +484,16 @@ def fetch_zkteco_transactions_with_retry(cfg, start_time, end_time):
                 
         except Exception as e:
             attempt += 1
-            frappe.log_error(f"Unexpected error fetching transactions (Attempt {attempt}/{max_retries}): {str(e)}", "ZKTeco Fetch Error")
+            error_msg = f"Unexpected error fetching transactions (Attempt {attempt}/{max_retries}): {str(e)}"
+            frappe.log_error(error_msg, "ZKTeco Fetch Error")
+            log_integration_request("fetch_zkteco_transactions_with_retry", "Failed", error=error_msg)
+            
             if attempt < max_retries and cfg.enable_retry_on_failure:
                 time.sleep(retry_interval)
             else:
                 return []
     
-    return []
-
-
-# def create_debug_log(message):
-#     """Create Integration Log entry for debugging"""
-#     try:
-#         doc = frappe.get_doc({
-#             "doctype": "Integration Log",
-#             "response": message
-#         })
-#         doc.insert(ignore_permissions=True)
-#         frappe.db.commit()
-
-#     except Exception as e:
-#         frappe.log_error(frappe.get_traceback(), "Integration Log Debug Error")
-#         raise
+    return all_transactions
 
 
 def create_employee_checkin(transaction):
@@ -401,8 +509,6 @@ def create_employee_checkin(transaction):
         device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
         transaction_id = transaction.get('id')
 
-        
-        
         if not emp_code or not punch_time:
             frappe.log_error(f"Missing required fields in transaction: {transaction}", "ZKTeco Transaction Error")
             return False
@@ -451,7 +557,6 @@ def create_employee_checkin(transaction):
                     else:
                         log_type = "IN"
 
-        
         # Check if checkin already exists (use transaction ID for uniqueness)
         existing_checkin = frappe.db.exists("Employee Checkin", {
             "employee": employee,
@@ -494,7 +599,6 @@ def create_employee_checkin(transaction):
             "skip_auto_attendance": 0
         })
 
-        
         checkin.insert(ignore_permissions=True)
         frappe.db.commit()
         
@@ -558,16 +662,19 @@ def manual_sync():
     """
     try:
         sync_zkteco_transactions()
+        log_integration_request("manual_sync", "Success", response={"message": "Sync completed successfully"})
         return {"success": True, "message": "Sync completed successfully"}
     except Exception as e:
-        frappe.log_error(f"Manual sync failed: {str(e)}", "ZKTeco Manual Sync")
-        return {"success": False, "message": f"Sync failed: {str(e)}"}
+        error_msg = f"Manual sync failed: {str(e)}"
+        frappe.log_error(error_msg, "ZKTeco Manual Sync")
+        log_integration_request("manual_sync", "Failed", error=error_msg)
+        return {"success": False, "message": error_msg}
 
 
 @frappe.whitelist()
 def manual_pull_by_date_range():
     """
-    Manual pull transactions for a specific date range
+    Manual pull transactions for a specific date range with pagination
     Useful for backfilling missed transactions when device was unavailable
     """
     try:
@@ -610,8 +717,13 @@ def manual_pull_by_date_range():
                     
                     device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
                     
+                    employee = find_employee_by_code(emp_code)
+                    if not employee:
+                        skipped_count += 1
+                        continue
+                    
                     existing = frappe.db.exists("Employee Checkin", {
-                        "employee": find_employee_by_code(emp_code),
+                        "employee": employee,
                         "time": punch_datetime,
                         "device_id": device_id
                     })
@@ -628,7 +740,7 @@ def manual_pull_by_date_range():
                     error_count += 1
                     frappe.log_error(f"Error in manual pull for transaction {transaction}: {str(e)}", "ZKTeco Manual Pull Error")
             
-            return {
+            result = {
                 "success": True,
                 "message": f"Manual pull completed",
                 "processed": processed_count,
@@ -636,15 +748,23 @@ def manual_pull_by_date_range():
                 "skipped": skipped_count,
                 "total": len(transactions)
             }
+            
+            log_integration_request("manual_pull_by_date_range", "Success", response=result)
+            
+            return result
         else:
+            error_msg = "No transactions found for the specified date range"
+            log_integration_request("manual_pull_by_date_range", "NoData", response={"message": error_msg})
             return {
                 "success": False,
-                "message": "No transactions found for the specified date range"
+                "message": error_msg
             }
         
     except Exception as e:
-        frappe.log_error(f"Manual pull failed: {str(e)}", "ZKTeco Manual Pull Fatal Error")
-        return {"success": False, "message": f"Manual pull failed: {str(e)}"}
+        error_msg = f"Manual pull failed: {str(e)}"
+        frappe.log_error(error_msg, "ZKTeco Manual Pull Fatal Error")
+        log_integration_request("manual_pull_by_date_range", "Failed", error=error_msg)
+        return {"success": False, "message": error_msg}
 
 
 def scheduled_sync():
@@ -673,7 +793,9 @@ def scheduled_sync():
         sync_zkteco_transactions()
         
     except Exception as e:
-        frappe.log_error(f"Scheduled ZKTeco sync failed: {str(e)}", "ZKTeco Scheduled Sync Error")
+        error_msg = f"Scheduled ZKTeco sync failed: {str(e)}"
+        frappe.log_error(error_msg, "ZKTeco Scheduled Sync Error")
+        log_integration_request("scheduled_sync", "Failed", error=error_msg)
 
 
 def cleanup_scheduler_check():
