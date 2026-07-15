@@ -1,4 +1,3 @@
-
 # Copyright (c) 2025, osama.ahmed@deliverydevs.com
 # For license information, please see license.txt
 
@@ -9,6 +8,7 @@ import requests
 from frappe.utils import today, now_datetime, get_datetime, flt
 from datetime import datetime, timedelta
 import json
+import time
 
 
 class ZKTecoConfig(Document):
@@ -236,7 +236,7 @@ def sync_zkteco_transactions():
             if last_sync.year < 2000:
                 last_sync = current_time - timedelta(days=1)
 
-        transactions = fetch_zkteco_transactions(cfg, last_sync, current_time)
+        transactions = fetch_zkteco_transactions_with_retry(cfg, last_sync, current_time)
         
         if transactions:
             processed_count = 0
@@ -256,12 +256,23 @@ def sync_zkteco_transactions():
             total_synced = frappe.db.get_single_value("ZKTeco Config", "total_synced_records") or 0
             frappe.db.set_single_value("ZKTeco Config", "last_sync", current_time)
             frappe.db.set_single_value("ZKTeco Config", "total_synced_records", total_synced + processed_count)
+            
+            # Update sync status
+            sync_status = "Success" if error_count == 0 else "Partial" if processed_count > 0 else "Failed"
+            frappe.db.set_single_value("ZKTeco Config", "last_sync_status", sync_status)
+            frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", 0)
+            
             frappe.db.commit()
             
             frappe.logger().info(f"ZKTeco Sync completed: {processed_count} processed, {error_count} errors")
         
     except Exception as e:
         frappe.log_error(f"ZKTeco sync failed: {str(e)}", "ZKTeco Sync Fatal Error")
+        # Update failed attempts counter
+        failed_attempts = frappe.db.get_single_value("ZKTeco Config", "failed_sync_attempts") or 0
+        frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", failed_attempts + 1)
+        frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Failed")
+        frappe.db.commit()
 
 
 def fetch_zkteco_transactions(cfg, start_time, end_time):
@@ -303,6 +314,63 @@ def fetch_zkteco_transactions(cfg, start_time, end_time):
     except Exception as e:
         frappe.log_error(f"Failed to fetch ZKTeco transactions: {str(e)}", "ZKTeco API Error")
         return []
+
+
+def fetch_zkteco_transactions_with_retry(cfg, start_time, end_time):
+    """
+    Fetch transactions from ZKTeco device with retry mechanism
+    Handles device unavailability gracefully
+    """
+    max_retries = int(cfg.max_retry_attempts or 3) if cfg.enable_retry_on_failure else 1
+    retry_interval = int(cfg.retry_interval_seconds or 60) if cfg.enable_retry_on_failure else 0
+    attempt = 0
+    
+    while attempt < max_retries:
+        try:
+            transactions = fetch_zkteco_transactions(cfg, start_time, end_time)
+            if transactions:
+                # Reset failed attempts on successful fetch
+                frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", 0)
+                frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Success")
+                frappe.db.commit()
+                return transactions
+            else:
+                # Empty result but no error - might be no transactions
+                return []
+                
+        except requests.exceptions.ConnectionError as e:
+            attempt += 1
+            frappe.log_error(
+                f"ZKTeco device connection failed (Attempt {attempt}/{max_retries}): {str(e)}", 
+                "ZKTeco Connection Error"
+            )
+            
+            if attempt < max_retries and cfg.enable_retry_on_failure:
+                frappe.logger().info(f"Retrying in {retry_interval} seconds...")
+                time.sleep(retry_interval)
+                # Update status to indicate we're retrying
+                frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Retrying")
+                frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", attempt)
+                frappe.db.commit()
+            else:
+                frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Failed")
+                frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", attempt)
+                frappe.db.commit()
+                frappe.log_error(
+                    f"ZKTeco device unavailable after {max_retries} attempts. Will retry on next scheduled sync.", 
+                    "ZKTeco Device Unavailable"
+                )
+                return []
+                
+        except Exception as e:
+            attempt += 1
+            frappe.log_error(f"Unexpected error fetching transactions (Attempt {attempt}/{max_retries}): {str(e)}", "ZKTeco Fetch Error")
+            if attempt < max_retries and cfg.enable_retry_on_failure:
+                time.sleep(retry_interval)
+            else:
+                return []
+    
+    return []
 
 
 # def create_debug_log(message):
@@ -496,6 +564,89 @@ def manual_sync():
         return {"success": False, "message": f"Sync failed: {str(e)}"}
 
 
+@frappe.whitelist()
+def manual_pull_by_date_range():
+    """
+    Manual pull transactions for a specific date range
+    Useful for backfilling missed transactions when device was unavailable
+    """
+    try:
+        cfg = frappe.get_single("ZKTeco Config")
+        
+        if not cfg.start_date or not cfg.end_date:
+            frappe.throw(_("Please specify both Start Date and End Date"))
+        
+        if not cfg.token:
+            frappe.throw(_("ZKTeco token not configured"))
+        
+        start_date = get_datetime(cfg.start_date)
+        end_date = get_datetime(cfg.end_date)
+        
+        # Add end of day to end_date
+        end_date = end_date.replace(hour=23, minute=59, second=59)
+        
+        if start_date > end_date:
+            frappe.throw(_("Start Date cannot be after End Date"))
+        
+        frappe.logger().info(f"Manual pull started for range: {start_date} to {end_date}")
+        
+        transactions = fetch_zkteco_transactions_with_retry(cfg, start_date, end_date)
+        
+        if transactions:
+            processed_count = 0
+            error_count = 0
+            skipped_count = 0
+            
+            for transaction in transactions:
+                try:
+                    # Check if already exists to skip duplicates
+                    emp_code = transaction.get('emp_code')
+                    punch_time = transaction.get('punch_time')
+                    
+                    if isinstance(punch_time, str):
+                        punch_datetime = get_datetime(punch_time)
+                    else:
+                        punch_datetime = punch_time
+                    
+                    device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
+                    
+                    existing = frappe.db.exists("Employee Checkin", {
+                        "employee": find_employee_by_code(emp_code),
+                        "time": punch_datetime,
+                        "device_id": device_id
+                    })
+                    
+                    if existing:
+                        skipped_count += 1
+                        continue
+                    
+                    if create_employee_checkin(transaction):
+                        processed_count += 1
+                    else:
+                        error_count += 1
+                except Exception as e:
+                    error_count += 1
+                    frappe.log_error(f"Error in manual pull for transaction {transaction}: {str(e)}", "ZKTeco Manual Pull Error")
+            
+            return {
+                "success": True,
+                "message": f"Manual pull completed",
+                "processed": processed_count,
+                "errors": error_count,
+                "skipped": skipped_count,
+                "total": len(transactions)
+            }
+        else:
+            return {
+                "success": False,
+                "message": "No transactions found for the specified date range"
+            }
+        
+    except Exception as e:
+        frappe.log_error(f"Manual pull failed: {str(e)}", "ZKTeco Manual Pull Fatal Error")
+        return {"success": False, "message": f"Manual pull failed: {str(e)}"}
+
+
 def scheduled_sync():
     """
     Scheduled sync function that respects the frequency setting
@@ -548,6 +699,8 @@ def get_sync_status():
         
         # Get last sync time
         last_sync = frappe.db.get_single_value("ZKTeco Config", "last_sync")
+        last_sync_status = frappe.db.get_single_value("ZKTeco Config", "last_sync_status")
+        failed_attempts = frappe.db.get_single_value("ZKTeco Config", "failed_sync_attempts") or 0
         
         # Count recent employee checkins from ZKTeco
         recent_checkins = frappe.db.count("Employee Checkin", {
@@ -559,9 +712,14 @@ def get_sync_status():
             "enabled": cfg.enable_sync,
             "sync_frequency": cfg.seconds,
             "last_sync": last_sync,
+            "last_sync_status": last_sync_status or "Never",
+            "failed_attempts": failed_attempts,
             "recent_checkins_24h": recent_checkins,
             "server_configured": bool(cfg.server_ip and cfg.server_port),
-            "token_configured": bool(cfg.token)
+            "token_configured": bool(cfg.token),
+            "retry_enabled": cfg.enable_retry_on_failure,
+            "max_retry_attempts": cfg.max_retry_attempts,
+            "retry_interval": cfg.retry_interval_seconds
         }
         
     except Exception as e:
