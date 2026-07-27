@@ -212,7 +212,14 @@ def get_scheduler_events():
                     "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
                 ]
             }
-        
+
+        # Daily full re-pull at ~00:00 as a backfill safety net (dedups, so it
+        # only adds punches that are missing). Merge it into whichever schedule
+        # was chosen above without clobbering an existing "cron" block.
+        daily_resync = "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.daily_full_resync"
+        cron_block = sync_schedule.setdefault("cron", {})
+        cron_block.setdefault("0 0 * * *", []).append(daily_resync)
+
         return sync_schedule
         
     except Exception as e:
@@ -230,7 +237,12 @@ if not scheduler_events:
         ],
         "hourly": [
             "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
-        ]
+        ],
+        "cron": {
+            "0 0 * * *": [
+                "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.daily_full_resync"
+            ]
+        }
     }
 
 # Testing
