@@ -1,5 +1,4 @@
 # Copyright (c) 2025, osama.ahmed@deliverydevs.com
-# For license information, please see license.txt
 
 import frappe
 from frappe.model.document import Document
