@@ -298,8 +298,23 @@ def sync_zkteco_transactions():
             if last_sync.year < 2000:
                 last_sync = current_time - timedelta(days=1)
 
-        transactions = fetch_zkteco_transactions_with_retry(cfg, last_sync, current_time)
-        
+        # Query a slightly OVERLAPPING window. Re-fetching the last couple of
+        # minutes guarantees we never miss a punch that landed exactly on the
+        # previous run's boundary. create_employee_checkin() de-duplicates, so
+        # the overlap is completely harmless.
+        overlap_seconds = 120
+        query_start = last_sync - timedelta(seconds=overlap_seconds)
+
+        transactions, fetch_ok = fetch_zkteco_transactions_with_retry(
+            cfg, query_start, current_time
+        )
+
+        if not fetch_ok:
+            # Device was unreachable after all retries. Do NOT advance last_sync
+            # so the next scheduled run retries this window and backfills. The
+            # failure was already logged once inside the retry helper.
+            return
+
         if transactions:
             processed_count = 0
             error_count = 0
@@ -339,7 +354,13 @@ def sync_zkteco_transactions():
             
             frappe.logger().info(f"ZKTeco Sync completed: {processed_count} processed, {error_count} errors out of {len(transactions)} fetched")
         else:
-            log_integration_request("sync_zkteco_transactions", "NoData", response={"message": "No transactions found"})
+            # Device was reachable but there were no new punches. Safe to advance
+            # last_sync so the query window doesn't grow without bound.
+            frappe.db.set_single_value("ZKTeco Config", "last_sync", current_time)
+            frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Success")
+            frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", 0)
+            frappe.db.commit()
+            log_integration_request("sync_zkteco_transactions", "NoData", response={"message": "No new transactions"})
         
     except Exception as e:
         frappe.log_error(f"ZKTeco sync failed: {str(e)}", "ZKTeco Sync Fatal Error")
@@ -352,148 +373,278 @@ def sync_zkteco_transactions():
         frappe.db.commit()
 
 
+def daily_full_resync():
+    """
+    Once-a-day safety net (runs ~00:00). Re-pulls the ENTIRE previous calendar
+    day's transactions and adds only the ones that are missing — anything already
+    stored is skipped by create_employee_checkin()'s de-duplication.
+
+    This backfills any punches the frequent incremental syncs missed while the
+    device was briefly offline. It deliberately does NOT touch `last_sync`, so it
+    never interferes with the normal incremental sync.
+    """
+    try:
+        cfg = frappe.get_single("ZKTeco Config")
+        if not cfg.enable_sync:
+            return
+        if not cfg.token:
+            frappe.log_error("ZKTeco token not configured", "ZKTeco Daily Resync")
+            return
+
+        now = now_datetime()
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Full previous calendar day: 00:00:00 .. 23:59:59 of yesterday.
+        start_time = day_start - timedelta(days=1)
+        end_time = day_start - timedelta(seconds=1)
+
+        frappe.logger().info(
+            f"ZKTeco daily full resync for {start_time} .. {end_time}"
+        )
+
+        transactions, fetch_ok = fetch_zkteco_transactions_with_retry(
+            cfg, start_time, end_time
+        )
+
+        if not fetch_ok:
+            # Device unreachable — don't treat as data loss; the next day's
+            # resync (and the incremental syncs) will still backfill.
+            log_integration_request(
+                "daily_full_resync", "Failed",
+                error="Device unreachable during daily resync; nothing backfilled this run."
+            )
+            return
+
+        added = 0
+        skipped = 0
+        errors = 0
+
+        for transaction in transactions:
+            try:
+                emp_code = transaction.get('emp_code')
+                punch_time = transaction.get('punch_time')
+                transaction_id = transaction.get('id')
+
+                if not emp_code or not punch_time:
+                    skipped += 1
+                    continue
+
+                if not find_employee_by_code(emp_code):
+                    skipped += 1
+                    continue
+
+                # Fast pre-check so we can count added vs skipped accurately.
+                # (create_employee_checkin also de-duplicates, so this is safe
+                #  even if the pre-check and the insert race.)
+                already = False
+                if transaction_id:
+                    already = bool(frappe.db.exists(
+                        "Employee Checkin",
+                        {"device_id": ["like", f"%(ZKTeco-{transaction_id})%"]}
+                    ))
+
+                if already:
+                    skipped += 1
+                    continue
+
+                if create_employee_checkin(transaction):
+                    added += 1
+                else:
+                    errors += 1
+
+            except Exception as e:
+                errors += 1
+                frappe.log_error(
+                    f"Daily resync error for transaction {transaction}: {str(e)}",
+                    "ZKTeco Daily Resync"
+                )
+
+        result = {
+            "added": added,
+            "skipped_existing": skipped,
+            "errors": errors,
+            "total_fetched": len(transactions),
+            "date": str(start_time.date()),
+        }
+        log_integration_request("daily_full_resync", "Success", response=result)
+        frappe.logger().info(f"ZKTeco daily resync done: {result}")
+
+    except Exception as e:
+        frappe.log_error(f"ZKTeco daily resync failed: {str(e)}", "ZKTeco Daily Resync Fatal")
+        log_integration_request("daily_full_resync", "Failed", error=str(e))
+
+
 def fetch_zkteco_transactions(cfg, start_time, end_time, page=1, page_size=100):
     """
-    Fetch transactions from ZKTeco device with pagination support
-    Returns tuple of (transactions, total_count)
+    Fetch a SINGLE page of transactions from the ZKTeco device.
+    Returns a tuple of (transactions, total_count).
+
+    IMPORTANT: network-level errors (connection refused, connect/read timeouts)
+    are intentionally NOT caught here — they propagate to the caller
+    (fetch_zkteco_transactions_with_retry) so it can retry the whole window.
+
+    Previously this function swallowed every exception and returned ([], 0),
+    which caused two bugs:
+      1. The retry mechanism never triggered (the wrapper never saw the error).
+      2. A timeout on a later page was indistinguishable from "no results", so a
+         partially-fetched window was treated as a complete success and the
+         missing pages were silently dropped when last_sync advanced.
     """
     server_ip = cfg.server_ip
     server_port = cfg.server_port
     token = cfg.token
-    
+
     base_url = f"http://{server_ip}:{server_port}/iclock/api/transactions/"
-    
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Token {token}",
     }
-    
+
     params = {
         "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
         "page": page,
         "page_size": page_size
     }
-    
-    try:
-        resp = requests.get(base_url, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        
-        data = resp.json()
-        
-        # Handle ZKTeco API response format - multiple variations
-        if isinstance(data, dict):
-            # Check for 'count' field to get total
-            total_count = data.get('count', 0)
-            
-            # Get transactions from various possible keys
-            if 'data' in data:
-                transactions = data['data']
-            elif 'results' in data:
-                transactions = data['results']
-            else:
-                transactions = data.get('results', [])
-            
-            return transactions, total_count
-        elif isinstance(data, list):
-            return data, len(data)
+
+    # (connect_timeout, read_timeout). A short connect timeout lets an
+    # unreachable/asleep device fail fast so the retry loop can kick in quickly,
+    # while a longer read timeout tolerates a slow-but-alive device.
+    resp = requests.get(base_url, headers=headers, params=params, timeout=(10, 45))
+    resp.raise_for_status()
+
+    data = resp.json()
+
+    # Handle ZKTeco API response format - multiple variations
+    if isinstance(data, dict):
+        total_count = data.get('count', 0)
+
+        if 'data' in data:
+            transactions = data['data']
+        elif 'results' in data:
+            transactions = data['results']
         else:
-            return [], 0
-            
-    except Exception as e:
-        frappe.log_error(f"Failed to fetch ZKTeco transactions (Page {page}): {str(e)}", "ZKTeco API Error")
+            transactions = data.get('results', [])
+
+        return transactions, total_count
+    elif isinstance(data, list):
+        return data, len(data)
+    else:
         return [], 0
 
 
 def fetch_zkteco_transactions_with_retry(cfg, start_time, end_time):
     """
-    Fetch ALL transactions from ZKTeco device with pagination and retry mechanism
-    Handles device unavailability gracefully
+    Fetch ALL transactions for the window [start_time, end_time], paging through
+    every result, with a retry mechanism for transient device/network failures.
+
+    Returns a tuple (transactions, ok):
+      - ok=True  -> the device was reachable and the FULL window was fetched
+                    (transactions may be an empty list if nobody punched).
+      - ok=False -> the device was unreachable after all retries. The caller
+                    MUST NOT advance last_sync in this case, so the same window
+                    is retried on the next scheduled run and nothing is lost.
+
+    Each attempt restarts pagination from page 1 and rebuilds the result set,
+    so a failure part-way through pagination never returns a partial (silently
+    truncated) result.
     """
     max_retries = int(cfg.max_retry_attempts or 3) if cfg.enable_retry_on_failure else 1
     retry_interval = int(cfg.retry_interval_seconds or 60) if cfg.enable_retry_on_failure else 0
-    attempt = 0
-    all_transactions = []
     page_size = 100
-    page = 1
-    total_count = 0
-    
-    while attempt < max_retries:
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
         try:
-            page = 1  # Reset page for this attempt
             all_transactions = []
             total_count = 0
-            
-            # Fetch all pages of transactions
+            page = 1
+
+            # Fetch every page for this window. Any network error raised by
+            # fetch_zkteco_transactions() propagates out to the except blocks
+            # below and aborts this attempt (partial results are discarded).
             while True:
-                frappe.logger().info(f"Fetching page {page} (page_size: {page_size}) from {start_time} to {end_time}")
-                
-                transactions, total_count = fetch_zkteco_transactions(cfg, start_time, end_time, page, page_size)
-                
+                frappe.logger().info(
+                    f"ZKTeco: fetching page {page} (size {page_size}) for "
+                    f"{start_time} .. {end_time} [attempt {attempt}/{max_retries}]"
+                )
+
+                transactions, total_count = fetch_zkteco_transactions(
+                    cfg, start_time, end_time, page, page_size
+                )
+
                 if not transactions:
                     break
-                
+
                 all_transactions.extend(transactions)
-                frappe.logger().info(f"Fetched page {page}: {len(transactions)} transactions. Total so far: {len(all_transactions)}/{total_count}")
-                
-                # Check if we have fetched all records
+
+                # Stop once we've collected everything the server says exists.
                 if len(all_transactions) >= total_count > 0:
-                    frappe.logger().info(f"All {total_count} transactions fetched successfully")
                     break
-                
+
                 page += 1
-                # Add small delay between pages to avoid overwhelming the API
-                time.sleep(0.5)
-            
-            # Success - we got all transactions (or no error occurred)
-            if all_transactions or total_count == 0:
-                # Reset failed attempts on successful fetch
-                frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", 0)
-                frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Success")
-                frappe.db.commit()
-                
-                log_integration_request("fetch_zkteco_transactions_with_retry", "Success",
-                                      response={"total_fetched": len(all_transactions), "total_available": total_count, 
-                                               "pages_fetched": page - 1})
-                
-                frappe.logger().info(f"Transaction fetch completed: {len(all_transactions)} records fetched")
-                return all_transactions
-                
-        except requests.exceptions.ConnectionError as e:
-            attempt += 1
-            error_msg = f"ZKTeco device connection failed (Attempt {attempt}/{max_retries}): {str(e)}"
-            frappe.log_error(error_msg, "ZKTeco Connection Error")
-            
+                time.sleep(0.5)  # be gentle on the device's tiny web server
+
+            # Reached here => the device answered every page for this window.
+            frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", 0)
+            frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Success")
+            frappe.db.commit()
+
+            log_integration_request(
+                "fetch_zkteco_transactions_with_retry", "Success",
+                response={
+                    "total_fetched": len(all_transactions),
+                    "total_available": total_count,
+                    "attempt": attempt,
+                },
+            )
+            frappe.logger().info(
+                f"ZKTeco fetch completed: {len(all_transactions)} records"
+            )
+            return all_transactions, True
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Transient network failure — device busy (someone punching), a brief
+            # internet blip, weak Wi-Fi, etc. This is EXPECTED occasionally and is
+            # only escalated to Error Log if every retry is exhausted, so a single
+            # blip no longer spams the Error Log.
+            last_error = e
+            frappe.logger().warning(
+                f"ZKTeco device unreachable (attempt {attempt}/{max_retries}): {e}"
+            )
+            frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Retrying")
+            frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", attempt)
+            frappe.db.commit()
+
             if attempt < max_retries and cfg.enable_retry_on_failure:
-                frappe.logger().info(f"Retrying in {retry_interval} seconds...")
                 time.sleep(retry_interval)
-                # Update status to indicate we're retrying
-                frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Retrying")
-                frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", attempt)
-                frappe.db.commit()
-            else:
-                frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Failed")
-                frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", attempt)
-                frappe.db.commit()
-                log_integration_request("fetch_zkteco_transactions_with_retry", "Failed", error=error_msg)
-                frappe.log_error(
-                    f"ZKTeco device unavailable after {max_retries} attempts. Will retry on next scheduled sync.", 
-                    "ZKTeco Device Unavailable"
-                )
-                return []
-                
+
         except Exception as e:
-            attempt += 1
-            error_msg = f"Unexpected error fetching transactions (Attempt {attempt}/{max_retries}): {str(e)}"
-            frappe.log_error(error_msg, "ZKTeco Fetch Error")
-            log_integration_request("fetch_zkteco_transactions_with_retry", "Failed", error=error_msg)
-            
+            # Unexpected (bad HTTP status, invalid JSON, etc.) — surface it once.
+            last_error = e
+            frappe.log_error(
+                f"Unexpected error fetching ZKTeco transactions "
+                f"(attempt {attempt}/{max_retries}): {str(e)}",
+                "ZKTeco Fetch Error",
+            )
             if attempt < max_retries and cfg.enable_retry_on_failure:
                 time.sleep(retry_interval)
-            else:
-                return []
-    
-    return all_transactions
+
+    # Every attempt failed — report once and signal failure to the caller.
+    frappe.db.set_single_value("ZKTeco Config", "last_sync_status", "Failed")
+    frappe.db.set_single_value("ZKTeco Config", "failed_sync_attempts", max_retries)
+    frappe.db.commit()
+
+    error_msg = (
+        f"ZKTeco device unavailable after {max_retries} attempt(s). "
+        f"Last error: {last_error}. Window {start_time} .. {end_time} will be "
+        f"retried on the next scheduled sync (last_sync was NOT advanced)."
+    )
+    frappe.log_error(error_msg, "ZKTeco Device Unavailable")
+    log_integration_request(
+        "fetch_zkteco_transactions_with_retry", "Failed", error=error_msg
+    )
+    return [], False
 
 
 def create_employee_checkin(transaction):
@@ -526,55 +677,47 @@ def create_employee_checkin(transaction):
             punch_datetime = punch_time
         
         # Determine log type based on punch_state
-        # 1. Start by assuming IN by default
         log_type = "IN"
         punch_display_lower = str(punch_state_display).strip().lower() if punch_state_display else ""
-        
-        # If punch_state is 255, we should ignore display and use fallback alternating logic
+
+        # If the device gave an explicit direction, TRUST it.
         if str(punch_state) != "255" and (str(punch_state) == "1" or punch_display_lower in ["check out", "out", "checkout"]):
             log_type = "OUT"
         elif str(punch_state) != "255" and (str(punch_state) == "0" or punch_display_lower in ["check in", "in", "checkin"]):
             log_type = "IN"
         else:
-            # Fallback for state 255 or unknown: alternate based on previous checkin today
-            last_log = frappe.db.get_all(
-                "Employee Checkin", 
-                filters={"employee": employee, "time": ["<", punch_datetime]}, 
-                fields=["log_type", "time"], 
-                order_by="time desc", 
-                limit=1
-            )
-            
-            if last_log:
-                last_log_type = last_log[0].get("log_type")
-                # Safely convert to datetime to avoid string attribute errors
-                last_log_time = get_datetime(last_log[0].get("time"))
-                
-                # If last log was on the same day, alternate the state
-                if last_log_time.date() == punch_datetime.date():
-                    if last_log_type == "IN":
-                        log_type = "OUT"
-                    else:
-                        log_type = "IN"
+            # punch_state 255 (or unmapped): the device recorded attendance but
+            # did NOT tell us the direction. We infer it from the punch's POSITION
+            # in the day by counting how many punches this employee already has
+            # earlier the same day:
+            #   0 earlier -> 1st punch  -> IN
+            #   1 earlier -> 2nd punch  -> OUT
+            #   2 earlier -> 3rd punch  -> IN ...
+            # Counting by timestamp (not by reading the previous record's stored
+            # log_type) means a single wrong/missed punch can no longer cascade
+            # and flip the rest of the day.
+            day_start = punch_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+            earlier_today = frappe.db.count("Employee Checkin", filters=[
+                ["employee", "=", employee],
+                ["time", ">=", day_start],
+                ["time", "<", punch_datetime],
+            ])
+            log_type = "IN" if earlier_today % 2 == 0 else "OUT"
 
-        # Check if checkin already exists (use transaction ID for uniqueness)
-        existing_checkin = frappe.db.exists("Employee Checkin", {
-            "employee": employee,
-            "time": punch_datetime,
-            "device_id": device_id
-        })
-        
-        if existing_checkin:
-            return True  # Already processed
-        
-        # Also check by transaction ID if we store it
+        # ---- De-duplicate ----
+        # Primary key: the device's unique transaction id, which we embed in
+        # device_id as "... (ZKTeco-<id>)". This is the most reliable check and
+        # is what makes re-pulls / overlapping windows / the daily resync safe.
         if transaction_id:
-            existing_by_id = frappe.db.get_value("Employee Checkin", 
-                                               {"device_id": device_id, "employee": employee}, 
-                                               "name", 
-                                               {"time": ["between", [punch_datetime - timedelta(seconds=5), punch_datetime + timedelta(seconds=5)]]})
-            if existing_by_id:
-                return True
+            if frappe.db.exists("Employee Checkin",
+                                {"device_id": ["like", f"%(ZKTeco-{transaction_id})%"]}):
+                return True  # Already processed
+
+        # Fallback for records created before the id was embedded, or if the
+        # device didn't send an id: same employee at the exact same second.
+        if frappe.db.exists("Employee Checkin",
+                            {"employee": employee, "time": punch_datetime}):
+            return True
 
         # Fetch Shift from latest Shift Assignment
         shift = frappe.db.sql("""
@@ -697,8 +840,13 @@ def manual_pull_by_date_range():
         
         frappe.logger().info(f"Manual pull started for range: {start_date} to {end_date}")
         
-        transactions = fetch_zkteco_transactions_with_retry(cfg, start_date, end_date)
-        
+        transactions, fetch_ok = fetch_zkteco_transactions_with_retry(cfg, start_date, end_date)
+
+        if not fetch_ok:
+            error_msg = "Device unreachable after retries. Please try again when the device is online."
+            log_integration_request("manual_pull_by_date_range", "Failed", error=error_msg)
+            return {"success": False, "message": error_msg}
+
         if transactions:
             processed_count = 0
             error_count = 0
