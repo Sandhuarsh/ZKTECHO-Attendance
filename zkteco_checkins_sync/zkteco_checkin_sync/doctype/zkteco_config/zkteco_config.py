@@ -1,4 +1,5 @@
 # Copyright (c) 2025, osama.ahmed@deliverydevs.com
+# For license information, please see license.txt
 
 import frappe
 from frappe.model.document import Document
@@ -372,44 +373,37 @@ def sync_zkteco_transactions():
         frappe.db.commit()
 
 
-def daily_full_resync():
+def _resync_window(start_time, end_time, label):
     """
-    Once-a-day safety net (runs ~00:00). Re-pulls the ENTIRE previous calendar
-    day's transactions and adds only the ones that are missing — anything already
-    stored is skipped by create_employee_checkin()'s de-duplication.
+    Shared backfill worker used by the scheduled resync jobs.
 
-    This backfills any punches the frequent incremental syncs missed while the
-    device was briefly offline. It deliberately does NOT touch `last_sync`, so it
-    never interferes with the normal incremental sync.
+    Re-pulls every transaction in [start_time, end_time] and adds ONLY the ones
+    that are missing — anything already stored is skipped via the unique device
+    transaction id. It deliberately does NOT touch `last_sync`, so it never
+    interferes with the normal incremental sync.
+
+    `label` is just used for logging so the two jobs are distinguishable.
     """
     try:
         cfg = frappe.get_single("ZKTeco Config")
         if not cfg.enable_sync:
             return
         if not cfg.token:
-            frappe.log_error("ZKTeco token not configured", "ZKTeco Daily Resync")
+            frappe.log_error("ZKTeco token not configured", label)
             return
 
-        now = now_datetime()
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        # Full previous calendar day: 00:00:00 .. 23:59:59 of yesterday.
-        start_time = day_start - timedelta(days=1)
-        end_time = day_start - timedelta(seconds=1)
-
-        frappe.logger().info(
-            f"ZKTeco daily full resync for {start_time} .. {end_time}"
-        )
+        frappe.logger().info(f"ZKTeco {label} for {start_time} .. {end_time}")
 
         transactions, fetch_ok = fetch_zkteco_transactions_with_retry(
             cfg, start_time, end_time
         )
 
         if not fetch_ok:
-            # Device unreachable — don't treat as data loss; the next day's
-            # resync (and the incremental syncs) will still backfill.
+            # Device unreachable — not data loss; later resyncs / incremental
+            # syncs will still backfill.
             log_integration_request(
-                "daily_full_resync", "Failed",
-                error="Device unreachable during daily resync; nothing backfilled this run."
+                label, "Failed",
+                error="Device unreachable during resync; nothing backfilled this run."
             )
             return
 
@@ -453,8 +447,7 @@ def daily_full_resync():
             except Exception as e:
                 errors += 1
                 frappe.log_error(
-                    f"Daily resync error for transaction {transaction}: {str(e)}",
-                    "ZKTeco Daily Resync"
+                    f"{label} error for transaction {transaction}: {str(e)}", label
                 )
 
         result = {
@@ -462,14 +455,39 @@ def daily_full_resync():
             "skipped_existing": skipped,
             "errors": errors,
             "total_fetched": len(transactions),
-            "date": str(start_time.date()),
+            "window_start": str(start_time),
+            "window_end": str(end_time),
         }
-        log_integration_request("daily_full_resync", "Success", response=result)
-        frappe.logger().info(f"ZKTeco daily resync done: {result}")
+        log_integration_request(label, "Success", response=result)
+        frappe.logger().info(f"ZKTeco {label} done: {result}")
 
     except Exception as e:
-        frappe.log_error(f"ZKTeco daily resync failed: {str(e)}", "ZKTeco Daily Resync Fatal")
-        log_integration_request("daily_full_resync", "Failed", error=str(e))
+        frappe.log_error(f"ZKTeco {label} failed: {str(e)}", f"{label} Fatal")
+        log_integration_request(label, "Failed", error=str(e))
+
+
+def daily_full_resync():
+    """
+    Runs ~00:00. Re-pulls the ENTIRE previous calendar day as an overnight
+    safety net (deduped, so only missing punches are added).
+    """
+    now = now_datetime()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_time = day_start - timedelta(days=1)      # yesterday 00:00:00
+    end_time = day_start - timedelta(seconds=1)      # yesterday 23:59:59
+    _resync_window(start_time, end_time, "ZKTeco Daily Resync")
+
+
+def midday_resync():
+    """
+    Runs ~14:00 (2 PM). Re-pulls TODAY so far — from 00:00 up to the moment it
+    runs — so anything missed during the morning is backfilled without waiting
+    for the midnight sweep (deduped, so only missing punches are added).
+    """
+    now = now_datetime()
+    start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)  # today 00:00
+    end_time = now                                                       # right now (~14:00)
+    _resync_window(start_time, end_time, "ZKTeco Midday Resync")
 
 
 def fetch_zkteco_transactions(cfg, start_time, end_time, page=1, page_size=100):
