@@ -217,8 +217,10 @@ def get_scheduler_events():
         # only adds punches that are missing). Merge it into whichever schedule
         # was chosen above without clobbering an existing "cron" block.
         daily_resync = "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.daily_full_resync"
+        midday_resync = "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.midday_resync"
         cron_block = sync_schedule.setdefault("cron", {})
         cron_block.setdefault("0 0 * * *", []).append(daily_resync)
+        cron_block.setdefault("0 14 * * *", []).append(midday_resync)
 
         return sync_schedule
         
@@ -241,6 +243,9 @@ if not scheduler_events:
         "cron": {
             "0 0 * * *": [
                 "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.daily_full_resync"
+            ],
+            "0 14 * * *": [
+                "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.midday_resync"
             ]
         }
     }
