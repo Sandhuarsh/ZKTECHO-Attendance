@@ -153,7 +153,13 @@ def get_scheduler_events():
     Dynamic scheduler that adjusts based on ZKTeco Config settings
     """
     import frappe
-    
+
+    # hooks.py is imported in contexts that have no database bound (bench build,
+    # bench CLI commands, worker boot). Reading the config there raises, so fall
+    # back to the static schedule below instead of erroring on every import.
+    if not frappe.db:
+        return {}
+
     # Get sync settings
     try:
         cfg = frappe.get_single("ZKTeco Config")
@@ -225,7 +231,9 @@ def get_scheduler_events():
         return sync_schedule
         
     except Exception as e:
-        frappe.log_error(f"Error in ZKTeco dynamic scheduler: {str(e)}", "ZKTeco Scheduler Error")
+        # Log to file, not the DB: this runs at import time, where log_error can
+        # itself fail ("Failed to log error in db") and mask the real problem.
+        frappe.logger("zkteco_checkins_sync").warning(f"Error in ZKTeco dynamic scheduler: {e}")
         return {}
 
 # Apply dynamic scheduler
