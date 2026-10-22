@@ -22,6 +22,10 @@
   "date_range_section",
   "start_date",
   "end_date",
+  "filter_by_employee",
+  "employee",
+  "filter_by_shift_type",
+  "shift_type",
   "column_break_date",
   "manual_pull_range",
   "retry_mechanism_section",
@@ -140,6 +144,36 @@
    "fieldname": "end_date",
    "fieldtype": "Date",
    "label": "End Date"
+  },
+  {
+   "default": "0",
+   "description": "Pull check-ins of one particular employee only",
+   "fieldname": "filter_by_employee",
+   "fieldtype": "Check",
+   "label": "Pull for Particular Employee"
+  },
+  {
+   "depends_on": "eval:doc.filter_by_employee",
+   "fieldname": "employee",
+   "fieldtype": "Link",
+   "label": "Employee",
+   "mandatory_depends_on": "eval:doc.filter_by_employee",
+   "options": "Employee"
+  },
+  {
+   "default": "0",
+   "description": "Pull check-ins of employees assigned to one particular shift type only",
+   "fieldname": "filter_by_shift_type",
+   "fieldtype": "Check",
+   "label": "Pull for Particular Shift Type"
+  },
+  {
+   "depends_on": "eval:doc.filter_by_shift_type",
+   "fieldname": "shift_type",
+   "fieldtype": "Link",
+   "label": "Shift Type",
+   "mandatory_depends_on": "eval:doc.filter_by_shift_type",
+   "options": "Shift Type"
   },
   {
    "fieldname": "column_break_date",

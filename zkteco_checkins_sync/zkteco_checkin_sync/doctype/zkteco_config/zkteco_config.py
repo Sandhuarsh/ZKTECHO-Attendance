@@ -864,6 +864,37 @@ def manual_pull_by_date_range():
             log_integration_request("manual_pull_by_date_range", "Failed", error=error_msg)
             return {"success": False, "message": error_msg}
 
+        # Optional filters: particular employee and/or particular shift type
+        if cfg.filter_by_employee and cfg.employee:
+            transactions = [
+                t for t in transactions
+                if find_employee_by_code(t.get('emp_code')) == cfg.employee
+            ]
+
+        if cfg.filter_by_shift_type and cfg.shift_type:
+            shift_cache = {}
+
+            def _employee_shift(employee):
+                # Same rule create_employee_checkin uses: latest submitted Shift Assignment
+                if employee not in shift_cache:
+                    row = frappe.db.sql("""
+                        SELECT shift_type
+                        FROM `tabShift Assignment`
+                        WHERE employee = %s
+                          AND docstatus = 1
+                        ORDER BY creation DESC
+                        LIMIT 1
+                    """, (employee,), as_dict=True)
+                    shift_cache[employee] = row[0].shift_type if row else None
+                return shift_cache[employee]
+
+            filtered = []
+            for t in transactions:
+                emp = find_employee_by_code(t.get('emp_code'))
+                if emp and _employee_shift(emp) == cfg.shift_type:
+                    filtered.append(t)
+            transactions = filtered
+
         if transactions:
             processed_count = 0
             error_count = 0
